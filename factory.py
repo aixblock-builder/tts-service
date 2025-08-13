@@ -1,8 +1,19 @@
 from __future__ import annotations
+import importlib
+import pkgutil
 from typing import Any
-from realtimetts_plugins import get_registry, get_plugin_class
-
+from tts_plugin_base import get_registry, get_plugin_class
+import plugins
 class TTSFactory:
+    @staticmethod
+    def _ensure_plugins_loaded() -> None:
+        """Auto-discover & import tất cả module plugin trong realtimetts_plugins.
+        Giải quyết lỗi Engines: [] khi các module (kokoro/xtts) chưa được import.
+        """
+        for m in pkgutil.iter_modules(plugins.__path__):
+            if not m.ispkg:
+                importlib.import_module(f"{plugins.__name__}.{m.name}")
+                
     @staticmethod
     def engines():
         return list(get_registry().keys())

@@ -1,110 +1,130 @@
-import asyncio
+import asyncio, json, re
 from contextlib import asynccontextmanager
-from typing import AsyncGenerator, Dict
+from typing import AsyncGenerator, List
 
 from fastapi import FastAPI, Query
-from fastapi.responses import StreamingResponse
+from fastapi.responses import FileResponse, StreamingResponse
 
 # pip install "realtimetts[kokoro]" fastapi uvicorn
-from RealtimeTTS import TextToAudioStream, KokoroEngine
+from factory import TTSFactory
 
-app = FastAPI(title="RealtimeTTS + Kokoro (Preload, Multi-language)")
-
-# ====== CACHE NHIỀU ENGINE THEO LANG ======
-ENGINES: Dict[str, KokoroEngine] = {}
-ENGINE_LOCK = asyncio.Lock()
-
-# Tùy bạn định nghĩa các lang hot để preload (ví dụ: 'a'=American, 'b'=British, ...).
-PRELOAD_LANGS = ["a", "b"]
-
-async def get_engine(lang_code: str) -> KokoroEngine:
-    # Lấy engine theo lang; nếu chưa có thì tạo (lazy) và cache.
-    if lang_code in ENGINES:
-        return ENGINES[lang_code]
-    async with ENGINE_LOCK:
-        # Double-check trong lock
-        if lang_code not in ENGINES:
-            ENGINES[lang_code] = KokoroEngine(lang_code=lang_code)
-            print(f"[LazyLoad] KokoroEngine loaded for lang_code='{lang_code}'")
-        return ENGINES[lang_code]
+# kokoro config
+config = {
+    "engine_name": "kokoro",
+    "engine_kwargs": {
+        "voice": "af_heart",
+    }
+}
+# xtts config
+# config = {
+#     "engine_name": "coqui",
+#     "engine_kwargs": {
+#         "model_name": "tts_models/multilingual/multi-dataset/xtts_v2",
+#         "specific_model": "v2.0.2",
+#         "voices_path": "./speakers",
+#     }
+# }
+# plugin = TTSFactory.create("coqui", **config["engine_kwargs"])
+engine = None
+TextToAudioStream = None
     
 @asynccontextmanager
-async def lifespan():
-    async with ENGINE_LOCK:
-        for lang in PRELOAD_LANGS:
-            if lang not in ENGINES:
-                ENGINES[lang] = KokoroEngine(lang_code=lang)
-                print(f"[Startup] Preloaded KokoroEngine for lang_code='{lang}'")
+async def lifespan(app: FastAPI):
+    global engine, TextToAudioStream, config
+    from RealtimeTTS import TextToAudioStream as _TextToAudioStream
+    TextToAudioStream = _TextToAudioStream
+    try:
+        TTSFactory._ensure_plugins_loaded()
+    except Exception:
+        pass
     print("[Startup] All preloads done.")
-    yield
-    async with ENGINE_LOCK:
-        ENGINES.clear()
-    print("[Shutdown] Engines cache cleared.")
+    plugin = TTSFactory.create(config["engine_name"], **config["engine_kwargs"])
+    engine = plugin.get_engine() 
+    print("[Startup] Engine ready.")
+    try:
+        yield
+    finally:
+        print("[Shutdown] Engines cache cleared.")
 
-    
+app = FastAPI(
+    title="TTS model",
+    lifespan=lifespan,
+    openapi_url="/swagger.json",
+    docs_url="/swagger",
+)
+
+def split_sentences(text: str) -> List[str]:
+    # tách câu đơn giản; tùy ý thay thế cho phù hợp tiếng Việt
+    parts = re.split(r'(?<=[\.\?\!…。！？])\s+', text.strip())
+    return [p for p in parts if p]
 
 # ====== STREAMING HANDLER ======
-async def stream_tts_bytes(text: str, voice: str, speed: float, lang: str) -> AsyncGenerator[bytes, None]:
-    """
-    Stream audio bytes PCM s16le 24kHz từ RealtimeTTS (engine Kokoro).
-    """
-    engine = await get_engine(lang)
-
+async def synth_sentence_pcm(sentence: str) -> bytes:
     q: asyncio.Queue[bytes] = asyncio.Queue()
     done = asyncio.Event()
+    loop = asyncio.get_running_loop()
 
     def on_chunk(b: bytes):
-        q.put_nowait(b)
+        loop.call_soon_threadsafe(q.put_nowait, b)
 
     def on_stop():
-        done.set()
+        loop.call_soon_threadsafe(done.set)
 
-    # Tạo stream per-request, tái sử dụng engine theo lang
     stream = TextToAudioStream(
         engine=engine,
         muted=True,
         on_audio_stream_stop=on_stop,
     )
-
-    # Lưu ý: truyền voice/speed per-utterance (engine đã cố định lang)
     stream.play_async(
         buffer_threshold_seconds=0.0,
         on_audio_chunk=on_chunk,
-        voice=voice,
-        speed=speed,
     )
-    stream.feed(text)
+    stream.feed(sentence)
 
+    chunks: List[bytes] = []
     while True:
         if done.is_set() and q.empty():
             break
         try:
-            chunk = await asyncio.wait_for(q.get(), timeout=0.1)
-            yield chunk
+            chunk = await asyncio.wait_for(q.get(), timeout=0.2)
+            chunks.append(chunk)
         except asyncio.TimeoutError:
             continue
+    return b"".join(chunks)
+
+@app.get("/")
+async def root():
+    return FileResponse("index.html", media_type="text/html")
 
 # ====== API ======
-@app.get("/tts")
+@app.get("/tts-only")
 async def tts(
     text: str = Query(..., min_length=1, description="Nội dung cần đọc"),
-    voice: str = Query("af_heart", description="Mã giọng Kokoro (phải khớp lang)"),
-    lang: str = Query("a", description="Mã ngôn ngữ/model của Kokoro, ví dụ: 'a' (American), 'b' (British)"),
-    speed: float = Query(1.0, ge=0.5, le=2.0, description="Tốc độ đọc 0.5–2.0"),
 ):
-    generator = stream_tts_bytes(text=text, voice=voice, speed=speed, lang=lang)
-    return StreamingResponse(
-        generator,
-        media_type="audio/pcm",
-        headers={
-            "X-Audio-Sample-Rate": "24000",
-            "X-Audio-Codec": "s16le",
-            "X-Audio-Channels": "1",
-        },
-    )
+    sentences = split_sentences(text)
+
+    async def generator() -> AsyncGenerator[bytes, None]:
+        for index, sentence in enumerate(sentences):
+            audio_bytes = await synth_sentence_pcm(sentence)
+
+            # CẢNH BÁO: list(audio_bytes) rất to; cân nhắc dùng base64 (xem ghi chú bên dưới)
+            json_data = {
+                "text_index": index,
+                "is_last": index == len(sentences) - 1,
+                "text_length": len(sentence),
+                "text": [sentence],
+                "audio": list(audio_bytes),  # hoặc "audio_b64": base64.b64encode(audio_bytes).decode()
+                "sample_rate": 24000,
+                "sample_format": "s16le",
+                "channels": 1,
+            }
+            line = json.dumps(json_data, ensure_ascii=False) + "\n"
+            yield line.encode("utf-8")
+
+    return StreamingResponse(generator(), media_type="application/x-ndjson")
 
 
-if "__name__" == "__main__":
+if __name__ == "__main__":
     import uvicorn
     uvicorn.run(
         app,

@@ -8,11 +8,10 @@ except Exception as e:  # pragma: no cover
     raise ImportError("Cần RealtimeTTS với CoquiEngine cho XTTS") from e
 
 @register_plugin
-class XTTSPlugin(BaseTTSPlugin):
+class CoquiPlugin(BaseTTSPlugin):
     @classmethod
     def key(cls) -> str:
-        return "xtts"
+        return "coqui"
 
     def build_engine(self) -> Any:
-        kwargs = dict(model="xtts", **self.engine_kwargs)
-        return CoquiEngine(**kwargs)
+        return CoquiEngine(**self.engine_kwargs)
